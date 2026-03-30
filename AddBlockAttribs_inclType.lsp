@@ -2,7 +2,8 @@
 ;; ADD-BLOCK-ATTRIBUTES.lsp
 ;; Adds EQ_NUM, NAME, and TYPE attribute definitions to all
 ;; block definitions in the current drawing.
-;; Safe to re-run — skips attributes that already exist.
+;; Safe to re-run — EQ_NUM and NAME are skipped if they already
+;; exist; TYPE is always overwritten with the derived value.
 ;; ============================================================
 
 (defun c:AddBlockAttribs ( / doc blkTable blkName blkDef added)
@@ -137,7 +138,7 @@
            )
         )
 
-        ;; TYPE third
+        ;; TYPE third — add if missing, overwrite default if already present
         (vl-catch-all-apply
           '(lambda ()
              (if (not (has-attrib blkDef "TYPE"))
@@ -146,7 +147,17 @@
                  (princ " -> Added TYPE")
                  (setq added (1+ added))
                )
-               (princ " -> TYPE exists, skipped")
+               (progn
+                 (vlax-for obj blkDef
+                   (if (and
+                         (= (vla-get-ObjectName obj) "AcDbAttributeDefinition")
+                         (= (strcase (vla-get-TagString obj)) "TYPE")
+                       )
+                     (vla-put-TextString obj (get-block-type blkName))
+                   )
+                 )
+                 (princ " -> TYPE updated")
+               )
              )
            )
         )
