@@ -1,0 +1,1118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MotionTech – Component Portal</title>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useCallback, useMemo, useRef, useEffect } = React;
+
+    // Global error catcher — shows the real error instead of a white screen
+    window.__portalError = null;
+    window.addEventListener("error", (e) => {
+      window.__portalError = e.message + "\n\nFile: " + e.filename + ":" + e.lineno + "\n\n" + (e.error?.stack || "");
+      document.getElementById("root").innerHTML =
+        '<div style="padding:24px;font-family:monospace;color:#dc2626;background:#fef2f2;margin:16px;border-radius:8px">' +
+        '<strong>Uncaught error — please copy this and report it:</strong>' +
+        '<pre style="margin-top:8px;white-space:pre-wrap;font-size:12px">' +
+        window.__portalError.replace(/</g,"&lt;") + '</pre></div>';
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DATA LOGIC
+    // ─────────────────────────────────────────────────────────────────────────
+
+    const parseATTEXT = (text) => {
+      const lines = text.trim().split("\n").filter((l) => l.trim());
+      return lines
+        .map((line) => {
+          const cols =
+            line.match(/'([^']*)'/g)?.map((v) => v.replace(/'/g, "")) || [];
+          return {
+            blName: cols[0] || "",
+            name:   cols[1] || "",
+            eqNum:  cols[2] || "",
+            type:   cols[3] || "",
+          };
+        })
+        .filter((r) => r.blName);
+    };
+
+    const getType = (blkName) => {
+      const n = blkName.toUpperCase();
+      const w = (...pats) =>
+        pats.some((pat) =>
+          new RegExp("^" + pat.replace(/[-[\]{}()+?.,\\^$|#\s]/g, "\\$&").replace(/\*/g, ".*") + "$").test(n)
+        );
+      if (w("LAC-PO-DR-*", "LAC-POB-DR-*"))            return "Drive - Poly-O";
+      if (w("*PR-OS-DRIVE*"))                           return "Drive - Pallet Roller";
+      if (w("LAC-PO-P*", "LAC-POB-P*", "LAC-POM-*"))  return "Conveyor - Poly-O";
+      if (w("LAC-PR-P*"))                               return "Conveyor - Pallet Roller";
+      if (w("LAC-PV*"))                                 return "Conveyor - Poly-V";
+      if (w("LAC-24V-TRANSFER*", "TONG CONVEYOR*"))     return "Conveyor";
+      if (w("IRB*", "KR_*"))                            return "Robot";
+      if (w("*GRIPPER*", "*TOOL*"))                     return "End Effector";
+      if (w("*RETRO-REFLECTIVE*", "*DIFFUSED PROXY*", "*DIFFUSED*PROXY*", "*LIGHT_CURTAIN*")) return "Sensor";
+      if (w("*PUSHER*", "*BLADE STOP*", "*DIVERT*", "*SEPARATION STATION*", "*SCISSOR LIFT*")) return "Actuator";
+      if (w("INFILLPLATE*", "PALLET*", "COMPACTOR*"))   return "Ancillary";
+      return "Other";
+    };
+
+    const resolveType = (row) => row.type || getType(row.blName);
+
+    const parseEqNum = (eq) => eq.split(".").map(Number);
+
+    const buildComponentList = (rows) => {
+      const map = {};
+      rows.forEach((r) => {
+        const eqNum = r.eqNum;
+        if (!eqNum || eqNum === r.blName + "-001") return;
+        // Key by eqNum + blName so different block types sharing an EQ number
+        // get separate rows with accurate individual counts
+        const key = eqNum + "||" + r.blName;
+        if (!map[key]) {
+          map[key] = {
+            rowKey: key,          // stable key for editData lookups
+            eqNum,
+            parts: parseEqNum(eqNum),
+            zone: eqNum.split(".")[0],
+            type: resolveType(r),
+            description: r.name || r.blName,
+            blName: r.blName,
+            qty: 0,
+          };
+        }
+        map[key].qty++;
+      });
+      return Object.values(map).sort((a, b) => {
+        for (let i = 0; i < Math.max(a.parts.length, b.parts.length); i++) {
+          const diff = (a.parts[i] || 0) - (b.parts[i] || 0);
+          if (diff !== 0) return diff;
+        }
+        return 0;
+      });
+    };
+
+    const buildTopology = (rows) => {
+      const items = rows
+        .filter((r) => r.eqNum && r.eqNum !== r.blName + "-001")
+        .map((r) => ({ ...r, parts: parseEqNum(r.eqNum) }))
+        .sort((a, b) => {
+          for (let i = 0; i < Math.max(a.parts.length, b.parts.length); i++) {
+            const diff = (a.parts[i] || 0) - (b.parts[i] || 0);
+            if (diff !== 0) return diff;
+          }
+          return 0;
+        });
+      const root = { children: {} };
+      items.forEach((item) => {
+        let node = root;
+        item.parts.forEach((p, i) => {
+          if (!node.children[p]) node.children[p] = { children: {}, items: [] };
+          if (i === item.parts.length - 1) node.children[p].items.push(item);
+          node = node.children[p];
+        });
+      });
+      return { tree: root, items };
+    };
+
+    const downloadComponentCSV = (components, editData) => {
+      const header = "EQ Number,Type,Description,Qty,Drives,Sensors";
+      const rows = components.map((c) => {
+        const d = editData[c.rowKey] || {};
+        return [
+          `"${c.eqNum}"`,
+          `"${c.type}"`,
+          `"${c.description.replace(/"/g, '""')}"`,
+          c.qty,
+          d.drives || 0,
+          d.sensors || 0,
+        ].join(",");
+      });
+      const csv = [header, ...rows].join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = "component-list.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ERROR BOUNDARY
+    // ─────────────────────────────────────────────────────────────────────────
+    class ErrorBoundary extends React.Component {
+      constructor(props) { super(props); this.state = { error: null }; }
+      static getDerivedStateFromError(e) { return { error: e }; }
+      render() {
+        if (this.state.error) {
+          return (
+            <div style={{ padding: 24, fontFamily: "monospace", color: "#dc2626", background: "#fef2f2", borderRadius: 8, margin: 16 }}>
+              <strong>Render error — please report this message:</strong>
+              <pre style={{ marginTop: 8, whiteSpace: "pre-wrap", fontSize: 12 }}>{this.state.error.message}{"\n\n"}{this.state.error.stack}</pre>
+              <button onClick={() => this.setState({ error: null })} style={{ marginTop: 12, padding: "6px 14px", cursor: "pointer" }}>Dismiss</button>
+            </div>
+          );
+        }
+        return this.props.children;
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // DESIGN TOKENS
+    // ─────────────────────────────────────────────────────────────────────────
+    const C = {
+      navy:      "#1e3a8a",
+      navyDark:  "#0d1f4f",
+      white:     "#ffffff",
+      offWhite:  "#f5f6f8",
+      rowAlt:    "#f0f4ff",
+      border:    "#e2e8f0",
+      text:      "#111827",
+      textMuted: "#6b7280",
+      textLight: "#9ca3af",
+      purple:    "#7c3aed",
+      blue:      "#2563eb",
+      green:     "#16a34a",
+    };
+
+    const TYPE_COLOR = {
+      "Conveyor - Poly-O":       "#2563eb",
+      "Conveyor - Pallet Roller": "#0891b2",
+      "Conveyor - Poly-V":       "#7c3aed",
+      "Conveyor":                "#6366f1",
+      "Drive - Poly-O":          "#ea580c",
+      "Drive - Pallet Roller":   "#dc2626",
+      "Robot":                   "#16a34a",
+      "End Effector":            "#ca8a04",
+      "Sensor":                  "#db2777",
+      "Actuator":                "#9333ea",
+      "Ancillary":               "#64748b",
+      "Other":                   "#9ca3af",
+    };
+
+    const typeColor = (type) => TYPE_COLOR[type] || "#9ca3af";
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MOTIONTECH LOGO
+    // ─────────────────────────────────────────────────────────────────────────
+    const MTLogo = ({ size = 1 }) => (
+      <div style={{ display: "flex", alignItems: "center", gap: 7 * size }}>
+        <span style={{ fontSize: 20 * size, fontWeight: 700, color: C.text, letterSpacing: "-0.02em" }}>
+          MotionTech
+        </span>
+        <svg width={28 * size} height={28 * size} viewBox="0 0 36 36" fill="none" aria-hidden="true">
+          <defs>
+            <linearGradient id={`mt_ring_${size}`} x1="4" y1="4" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+              <stop offset="0%" stopColor={C.purple} />
+              <stop offset="100%" stopColor={C.blue} />
+            </linearGradient>
+          </defs>
+          <circle cx="18" cy="18" r="13" stroke={`url(#mt_ring_${size})`} strokeWidth="4" fill="none" strokeLinecap="round" />
+        </svg>
+      </div>
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SHARED COMPONENTS
+    // ─────────────────────────────────────────────────────────────────────────
+    const Dropdown = ({ open, onClose, children, style: extraStyle = {} }) => {
+      const ref = useRef(null);
+      useEffect(() => {
+        if (!open) return;
+        const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) onClose(); };
+        document.addEventListener("mousedown", handler);
+        return () => document.removeEventListener("mousedown", handler);
+      }, [open, onClose]);
+      if (!open) return null;
+      return (
+        <div ref={ref} style={{
+          position: "absolute", zIndex: 200, background: C.white,
+          border: `1px solid ${C.border}`, borderRadius: 8,
+          boxShadow: "0 4px 16px rgba(0,0,0,0.12)", minWidth: 200,
+          padding: "8px 0", ...extraStyle,
+        }}>
+          {children}
+        </div>
+      );
+    };
+
+    const StatsCard = ({ label, value, total, color }) => (
+      <div style={{
+        flex: "1 1 0", minWidth: 140, padding: "14px 18px",
+        background: C.white, border: `1px solid ${C.border}`, borderRadius: 8,
+        boxShadow: "0 1px 3px rgba(0,0,0,0.04)",
+      }}>
+        <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted, marginBottom: 6 }}>
+          {label}
+        </div>
+        <div style={{ fontSize: 28, fontWeight: 800, color, letterSpacing: "-0.02em", lineHeight: 1 }}>
+          {value}
+        </div>
+        {total !== undefined && total !== value && (
+          <div style={{ fontSize: 11, color: C.textLight, marginTop: 4 }}>
+            of {total} total
+          </div>
+        )}
+      </div>
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TOPOLOGY SUB-COMPONENTS
+    // ─────────────────────────────────────────────────────────────────────────
+    const EqRow = ({ eqNum, name }) => (
+      <div style={{ display: "flex", alignItems: "center", gap: 14, padding: "7px 0", borderBottom: `1px solid ${C.border}` }}>
+        <span style={{ fontFamily: "monospace", fontSize: 12, color: C.navy, fontWeight: 700, width: 90, flexShrink: 0 }}>{eqNum}</span>
+        <span style={{ fontSize: 13, color: C.text }}>{name}</span>
+      </div>
+    );
+
+    const TopologyNode = ({ node, depth }) => {
+      const [open, setOpen] = useState(true);
+      const keys  = Object.keys(node.children).sort((a, b) => Number(a) - Number(b));
+      const items = node.items || [];
+      return (
+        <div style={{ marginLeft: depth * 18 }}>
+          {items.map((item, i) => <EqRow key={i} eqNum={item.eqNum} name={item.name} />)}
+          {keys.length > 0 && (
+            <>
+              <button onClick={() => setOpen((o) => !o)}
+                style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: C.textMuted, background: "none", border: "none", cursor: "pointer", padding: "4px 0", marginTop: 2, fontFamily: "inherit" }}>
+                <span>{open ? "\u25be" : "\u25b8"}</span>
+                <span>{keys.length} sub-item{keys.length !== 1 ? "s" : ""}</span>
+              </button>
+              {open && keys.map((k) => <TopologyNode key={k} node={node.children[k]} depth={depth + 1} />)}
+            </>
+          )}
+        </div>
+      );
+    };
+
+    const TopologyView = ({ rows }) => {
+      const { tree, items } = buildTopology(rows);
+      const lines = Object.keys(tree.children).sort((a, b) => Number(a) - Number(b));
+      const [openLines, setOpenLines] = useState({});
+
+      if (items.length === 0)
+        return (
+          <div style={{ textAlign: "center", padding: 36, color: C.textMuted, fontSize: 13, background: C.offWhite, borderRadius: 6, border: `1px solid ${C.border}` }}>
+            No EQ_NUM values assigned yet. Run the script, assign equipment numbers via EATTEDIT, then re-export.
+          </div>
+        );
+
+      return (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {lines.map((lineKey) => {
+            const lineNode    = tree.children[lineKey];
+            const isOpen      = openLines[lineKey] !== false;
+            const directCount = lineNode.items?.length || 0;
+            return (
+              <div key={lineKey} style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden" }}>
+                <button onClick={() => setOpenLines((s) => ({ ...s, [lineKey]: !isOpen }))}
+                  style={{ width: "100%", display: "flex", alignItems: "center", gap: 10, padding: "11px 18px", background: C.navy, color: C.white, border: "none", cursor: "pointer", textAlign: "left", fontFamily: "inherit" }}>
+                  <span style={{ fontSize: 12 }}>{isOpen ? "\u25be" : "\u25b8"}</span>
+                  <span style={{ fontWeight: 700, fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase" }}>Line {lineKey}</span>
+                  <span style={{ marginLeft: "auto", fontSize: 11, opacity: 0.65 }}>{directCount} direct item{directCount !== 1 ? "s" : ""}</span>
+                </button>
+                {isOpen && (
+                  <div style={{ padding: "14px 18px", background: C.white }}>
+                    {(lineNode.items || []).map((item, i) => <EqRow key={i} eqNum={item.eqNum} name={item.name} />)}
+                    {Object.keys(lineNode.children).sort((a, b) => Number(a) - Number(b)).map((k) => (
+                      <TopologyNode key={k} node={lineNode.children[k]} depth={1} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // NUMERIC CELL — fully uncontrolled so typing/committing causes no React
+    // state updates inside this component; the DOM manages the display value
+    // ─────────────────────────────────────────────────────────────────────────
+    const NumericCell = ({ storedValue, onCommit, activeColor }) => {
+      const ref = useRef(null);
+
+      // Only sync from outside when the input is not focused (e.g. file reload)
+      useEffect(() => {
+        if (ref.current && ref.current !== document.activeElement) {
+          ref.current.value = String(storedValue ?? 0);
+        }
+      }, [storedValue]);
+
+      return (
+        <input
+          ref={ref}
+          type="text"
+          inputMode="numeric"
+          defaultValue={String(storedValue ?? 0)}
+          onFocus={(e) => { e.target.select(); e.target.style.borderBottomColor = C.blue; }}
+          onBlur={(e) => {
+            e.target.style.borderBottomColor = "transparent";
+            const num = Math.max(0, parseInt(e.target.value) || 0);
+            e.target.value = String(num);
+            onCommit(num);
+          }}
+          onKeyDown={(e) => { if (e.key === "Enter") e.target.blur(); }}
+          style={{
+            width: 56, textAlign: "right", border: "none",
+            borderBottom: "1px solid transparent",
+            background: "transparent", fontSize: 12, fontFamily: "inherit",
+            color: (storedValue || 0) > 0 ? activeColor : C.textLight,
+            fontWeight: (storedValue || 0) > 0 ? "700" : "400",
+            outline: "none", padding: "2px 4px",
+            transition: "border-color 0.15s",
+          }}
+        />
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // COMPONENT GROUP SECTION
+    // ─────────────────────────────────────────────────────────────────────────
+    const ComponentGroupSection = ({ groupKey, items, editData, updateEdit }) => {
+      const [open, setOpen] = useState(true);
+
+      const tdStyle = (align = "left") => ({
+        padding: "6px 14px",
+        textAlign: align,
+        borderBottom: `1px solid ${C.border}`,
+        fontSize: 12,
+      });
+
+      const groupDrives  = items.reduce((s, r) => s + (editData[r.rowKey]?.drives || 0), 0);
+      const groupSensors = items.reduce((s, r) => s + (editData[r.rowKey]?.sensors || 0), 0);
+      const groupQty     = items.reduce((s, r) => s + r.qty, 0);
+
+      return (
+        <tbody>
+          {groupKey !== null && (
+            <tr onClick={() => setOpen((v) => !v)} style={{ background: "#e0e7ff", cursor: "pointer" }}>
+              <td colSpan={6}
+                style={{ padding: "6px 14px", fontWeight: 700, fontSize: 12, color: C.navy, letterSpacing: "0.05em" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                  <span>{open ? "\u25be" : "\u25b8"} {groupKey}</span>
+                  <span style={{ fontWeight: 400, color: C.textMuted, fontSize: 11 }}>
+                    ({items.length} item{items.length !== 1 ? "s" : ""})
+                  </span>
+                  <span style={{ marginLeft: "auto", fontWeight: 500, fontSize: 11, color: C.textMuted, display: "flex", gap: 14 }}>
+                    <span>Qty: <strong style={{ color: C.navy }}>{groupQty}</strong></span>
+                    <span>Drives: <strong style={{ color: "#ea580c" }}>{groupDrives}</strong></span>
+                    <span>Sensors: <strong style={{ color: "#db2777" }}>{groupSensors}</strong></span>
+                  </span>
+                </div>
+              </td>
+            </tr>
+          )}
+          {open && items.map((comp, i) => {
+            const color = typeColor(comp.type);
+            const d = editData[comp.rowKey] || {};
+            return (
+              <tr key={comp.rowKey} style={{ background: i % 2 === 0 ? C.white : C.rowAlt }}>
+                <td style={{ ...tdStyle(), fontFamily: "monospace", color: C.navy, fontWeight: 700 }}>
+                  {comp.eqNum}
+                </td>
+                <td style={tdStyle()}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                    <span style={{ width: 9, height: 9, borderRadius: "50%", background: color, flexShrink: 0 }} />
+                    <span style={{ color: C.text }}>{comp.type}</span>
+                  </div>
+                </td>
+                <td style={{ ...tdStyle(), fontFamily: "monospace", color: C.text }}>
+                  {comp.description}
+                </td>
+                <td style={{ ...tdStyle("right"), color: C.navy, fontWeight: 700 }}>
+                  {comp.qty}
+                </td>
+                <td style={{ ...tdStyle("right"), padding: "4px 8px" }}>
+                  <NumericCell
+                    storedValue={d.drives || 0}
+                    onCommit={(num) => updateEdit(comp.rowKey, "drives", num)}
+                    activeColor="#ea580c"
+                  />
+                </td>
+                <td style={{ ...tdStyle("right"), padding: "4px 8px" }}>
+                  <NumericCell
+                    storedValue={d.sensors || 0}
+                    onCommit={(num) => updateEdit(comp.rowKey, "sensors", num)}
+                    activeColor="#db2777"
+                  />
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // COMPONENT LIST VIEW
+    // ─────────────────────────────────────────────────────────────────────────
+    const ComponentListView = ({ rows, editData, setEditData }) => {
+      const allComponents = useMemo(() => buildComponentList(rows), [rows]);
+
+      const [sortCol, setSortCol]             = useState("eqNum");
+      const [sortDir, setSortDir]             = useState("asc");
+      const [typeFilters, setTypeFilters]     = useState(new Set());
+      const [textFilter, setTextFilter]       = useState("");
+      const [zoneFilter, setZoneFilter]       = useState("all");
+      const [groupBy, setGroupBy]             = useState("none");
+      const [typeMenuOpen, setTypeMenuOpen]   = useState(false);
+
+      const allTypes = useMemo(() => [...new Set(allComponents.map((r) => r.type))].sort(), [allComponents]);
+      const allZones = useMemo(() => [...new Set(allComponents.map((r) => r.zone))].sort((a, b) => Number(a) - Number(b)), [allComponents]);
+
+      const filtered = useMemo(() => {
+        let data = allComponents;
+        if (typeFilters.size) data = data.filter((r) => typeFilters.has(r.type));
+        if (zoneFilter !== "all") data = data.filter((r) => r.zone === zoneFilter);
+        if (textFilter) {
+          const q = textFilter.toLowerCase();
+          data = data.filter((r) =>
+            r.eqNum.toLowerCase().includes(q) ||
+            r.description.toLowerCase().includes(q) ||
+            r.type.toLowerCase().includes(q)
+          );
+        }
+        return data;
+      }, [allComponents, typeFilters, zoneFilter, textFilter]);
+
+      const sorted = useMemo(() => {
+        const dir = sortDir === "asc" ? 1 : -1;
+        return [...filtered].sort((a, b) => {
+          if (sortCol === "eqNum") {
+            for (let i = 0; i < Math.max(a.parts.length, b.parts.length); i++) {
+              const diff = (a.parts[i] || 0) - (b.parts[i] || 0);
+              if (diff !== 0) return dir * diff;
+            }
+            return 0;
+          }
+          if (sortCol === "qty") return dir * (a.qty - b.qty);
+          if (sortCol === "drives") return dir * ((editData[a.rowKey]?.drives || 0) - (editData[b.rowKey]?.drives || 0));
+          if (sortCol === "sensors") return dir * ((editData[a.rowKey]?.sensors || 0) - (editData[b.rowKey]?.sensors || 0));
+          const aVal = String(a[sortCol] ?? "");
+          const bVal = String(b[sortCol] ?? "");
+          return dir * aVal.localeCompare(bVal);
+        });
+      }, [filtered, sortCol, sortDir]); // editData intentionally omitted — drives/sensors sort uses current snapshot on interaction
+
+      const typeSummary = useMemo(() => {
+        const map = {};
+        filtered.forEach((r) => { map[r.type] = (map[r.type] || 0) + r.qty; });
+        return Object.entries(map).sort((a, b) => b[1] - a[1]);
+      }, [filtered]);
+
+      const grouped = useMemo(() => {
+        if (groupBy === "none") return [{ key: null, items: sorted }];
+        const map = {};
+        sorted.forEach((r) => {
+          const key = groupBy === "type" ? r.type : `Zone ${r.zone}`;
+          if (!map[key]) map[key] = [];
+          map[key].push(r);
+        });
+        return Object.entries(map).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true })).map(([key, items]) => ({ key, items }));
+      }, [sorted, groupBy]);
+
+      // Summary stats
+      const totalStats = useMemo(() => {
+        let qty = 0, drives = 0, sensors = 0;
+        allComponents.forEach((r) => {
+          qty += r.qty;
+          drives += (editData[r.rowKey]?.drives || 0);
+          sensors += (editData[r.rowKey]?.sensors || 0);
+        });
+        return { qty, drives, sensors };
+      }, [allComponents, editData]);
+
+      const filteredStats = useMemo(() => {
+        let qty = 0, drives = 0, sensors = 0;
+        filtered.forEach((r) => {
+          qty += r.qty;
+          drives += (editData[r.rowKey]?.drives || 0);
+          sensors += (editData[r.rowKey]?.sensors || 0);
+        });
+        return { qty, drives, sensors };
+      }, [filtered, editData]);
+
+      const handleSort = (col) => {
+        if (sortCol === col) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+        else { setSortCol(col); setSortDir("asc"); }
+      };
+
+      const toggleTypeFilter = (type) => {
+        setTypeFilters((prev) => {
+          const next = new Set(prev);
+          next.has(type) ? next.delete(type) : next.add(type);
+          return next;
+        });
+      };
+
+      const updateEdit = (rowKey, field, num) => {
+        setEditData((prev) => ({
+          ...prev,
+          [rowKey]: { ...prev[rowKey], [field]: num },
+        }));
+      };
+
+      const SortIcon = ({ col }) => {
+        if (sortCol !== col) return <span style={{ opacity: 0.3, fontSize: 10 }}>{"\u21c5"}</span>;
+        return <span style={{ fontSize: 10 }}>{sortDir === "asc" ? "\u25b2" : "\u25bc"}</span>;
+      };
+
+      const thStyle = (align = "left") => ({
+        textAlign: align,
+        padding: "9px 14px",
+        fontWeight: 600,
+        letterSpacing: "0.07em",
+        textTransform: "uppercase",
+        fontSize: 11,
+        userSelect: "none",
+        whiteSpace: "nowrap",
+      });
+
+      const tdStyle = (align = "left") => ({
+        padding: "6px 14px",
+        textAlign: align,
+        borderBottom: `1px solid ${C.border}`,
+        fontSize: 12,
+      });
+
+      return (
+        <div>
+          {/* TYPE PILLS */}
+          <div style={{ padding: "16px 18px", borderBottom: `1px solid ${C.border}`, background: C.offWhite }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.08em", textTransform: "uppercase", color: C.textMuted, marginBottom: 10 }}>
+              Components by Type
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {typeSummary.map(([type, total]) => {
+                const active = typeFilters.has(type);
+                const color  = typeColor(type);
+                return (
+                  <button
+                    key={type}
+                    onClick={() => toggleTypeFilter(type)}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 6,
+                      padding: "4px 10px 4px 7px", borderRadius: 20,
+                      border: `1.5px solid ${active ? color : C.border}`,
+                      background: active ? color + "18" : C.white,
+                      cursor: "pointer", fontFamily: "inherit",
+                      fontSize: 11, fontWeight: active ? 700 : 500,
+                      color: active ? color : C.text,
+                      transition: "all 0.12s",
+                    }}
+                  >
+                    <span style={{ width: 8, height: 8, borderRadius: "50%", background: color, flexShrink: 0 }} />
+                    <span>{type}</span>
+                    <span style={{ marginLeft: 2, fontWeight: 700, color: active ? color : C.textMuted }}>{total}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* STATS CARDS */}
+          <div style={{ padding: "16px 18px", borderBottom: `1px solid ${C.border}`, background: C.offWhite }}>
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+              <StatsCard label="Components" value={filteredStats.qty} total={totalStats.qty} color={C.navy} />
+              <StatsCard label="Drives" value={filteredStats.drives} total={totalStats.drives} color="#ea580c" />
+              <StatsCard label="Sensors" value={filteredStats.sensors} total={totalStats.sensors} color="#db2777" />
+            </div>
+          </div>
+
+          {/* TOOLBAR */}
+          <div style={{
+            padding: "10px 18px", borderBottom: `1px solid ${C.border}`,
+            display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+            background: C.white,
+          }}>
+            <input
+              value={textFilter}
+              onChange={(e) => setTextFilter(e.target.value)}
+              placeholder="Search EQ, description, type\u2026"
+              style={{ border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 10px", fontSize: 12, fontFamily: "inherit", outline: "none", width: 220, color: C.text }}
+            />
+
+            <select
+              value={zoneFilter}
+              onChange={(e) => setZoneFilter(e.target.value)}
+              style={{ border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 8px", fontSize: 12, fontFamily: "inherit", color: C.text, background: C.white, cursor: "pointer" }}
+            >
+              <option value="all">All zones</option>
+              {allZones.map((z) => <option key={z} value={z}>Zone {z}</option>)}
+            </select>
+
+            <select
+              value={groupBy}
+              onChange={(e) => setGroupBy(e.target.value)}
+              style={{ border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 8px", fontSize: 12, fontFamily: "inherit", color: C.text, background: C.white, cursor: "pointer" }}
+            >
+              <option value="none">No grouping</option>
+              <option value="type">Group by type</option>
+              <option value="zone">Group by zone</option>
+            </select>
+
+            <button
+              onClick={() => downloadComponentCSV(sorted, editData)}
+              style={{ marginLeft: "auto", padding: "5px 13px", borderRadius: 6, fontSize: 12, fontFamily: "inherit", border: `1px solid ${C.navy}`, background: C.navy, color: C.white, cursor: "pointer", fontWeight: 600 }}
+            >
+              {"\u2193"} Export CSV
+            </button>
+
+            <span style={{ fontSize: 11, color: C.textMuted, whiteSpace: "nowrap" }}>
+              Showing <strong>{filtered.length}</strong> of <strong>{allComponents.length}</strong> components
+            </span>
+          </div>
+
+          {/* TABLE */}
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ background: C.navy, color: C.white }}>
+                  {[
+                    { key: "eqNum",       label: "EQ Number",   align: "left"  },
+                    { key: "type",        label: "Type",         align: "left", filterable: true },
+                    { key: "description", label: "Description",  align: "left"  },
+                    { key: "qty",         label: "Qty",          align: "right" },
+                    { key: "drives",      label: "Drives",       align: "right" },
+                    { key: "sensors",     label: "Sensors",      align: "right" },
+                  ].map(({ key, label, align, filterable }) => (
+                    <th
+                      key={key}
+                      onClick={() => handleSort(key)}
+                      style={{ ...thStyle(align), cursor: "pointer" }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: 5, justifyContent: align === "right" ? "flex-end" : "flex-start" }}>
+                        {filterable ? (
+                          <div style={{ position: "relative" }}>
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setTypeMenuOpen((v) => !v); }}
+                              style={{ background: "none", border: "none", color: C.white, cursor: "pointer", fontSize: 11, padding: 0, fontFamily: "inherit", fontWeight: 600, letterSpacing: "0.07em", textTransform: "uppercase", display: "flex", alignItems: "center", gap: 4 }}
+                            >
+                              {label}
+                              <span style={{ fontSize: 9, opacity: typeFilters.size ? 1 : 0.6 }}>
+                                {typeFilters.size ? `\u25bc (${typeFilters.size})` : "\u25bc"}
+                              </span>
+                            </button>
+                            <Dropdown open={typeMenuOpen} onClose={() => setTypeMenuOpen(false)} style={{ top: "calc(100% + 6px)", left: 0 }}>
+                              <div style={{ padding: "6px 14px 4px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                                <span style={{ fontSize: 10, fontWeight: 700, color: C.textMuted, textTransform: "uppercase", letterSpacing: "0.06em" }}>Filter by Type</span>
+                                {typeFilters.size > 0 && (
+                                  <button onClick={() => setTypeFilters(new Set())}
+                                    style={{ fontSize: 10, color: C.blue, background: "none", border: "none", cursor: "pointer", fontFamily: "inherit" }}>
+                                    Clear
+                                  </button>
+                                )}
+                              </div>
+                              {allTypes.map((type) => (
+                                <label key={type} style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 14px", cursor: "pointer", fontSize: 13, color: C.text }}>
+                                  <input type="checkbox" checked={typeFilters.has(type)} onChange={() => toggleTypeFilter(type)} />
+                                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: typeColor(type), flexShrink: 0 }} />
+                                  {type}
+                                </label>
+                              ))}
+                            </Dropdown>
+                          </div>
+                        ) : label}
+                        <SortIcon col={key} />
+                      </div>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+
+              {grouped.map(({ key: groupKey, items }) => (
+                <ComponentGroupSection
+                  key={groupKey ?? "__all__"}
+                  groupKey={groupKey}
+                  items={items}
+                  editData={editData}
+                  updateEdit={updateEdit}
+                />
+              ))}
+
+              <tfoot>
+                <tr style={{ background: "#dbeafe" }}>
+                  <td colSpan={3}
+                    style={{ padding: "10px 14px", fontWeight: 700, color: C.navy, fontSize: 12, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+                    Totals
+                  </td>
+                  <td style={{ padding: "10px 14px", textAlign: "right", fontWeight: 800, color: C.navy, fontSize: 15 }}>
+                    {filteredStats.qty}
+                  </td>
+                  <td style={{ padding: "10px 14px", textAlign: "right", fontWeight: 800, color: "#ea580c", fontSize: 15 }}>
+                    {filteredStats.drives}
+                  </td>
+                  <td style={{ padding: "10px 14px", textAlign: "right", fontWeight: 800, color: "#db2777", fontSize: 15 }}>
+                    {filteredStats.sensors}
+                  </td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZONE SUMMARY VIEW
+    // ─────────────────────────────────────────────────────────────────────────
+    const ZoneSummaryView = ({ rows, editData }) => {
+      const allComponents = useMemo(() => buildComponentList(rows), [rows]);
+
+      const zoneData = useMemo(() => {
+        const map = {};
+        allComponents.forEach((c) => {
+          const z = c.zone;
+          if (!map[z]) map[z] = { zone: z, components: [], types: {} };
+          map[z].components.push(c);
+          map[z].types[c.type] = (map[z].types[c.type] || 0) + 1;
+        });
+        return Object.values(map).sort((a, b) => Number(a.zone) - Number(b.zone));
+      }, [allComponents]);
+
+      const totalStats = useMemo(() => {
+        let qty = 0, drives = 0, sensors = 0, types = {};
+        allComponents.forEach((c) => {
+          qty += c.qty;
+          drives += (editData[c.rowKey]?.drives || 0);
+          sensors += (editData[c.rowKey]?.sensors || 0);
+          types[c.type] = (types[c.type] || 0) + 1;
+        });
+        return { qty, drives, sensors, types, componentCount: allComponents.length };
+      }, [allComponents, editData]);
+
+      const TypeBar = ({ types, total }) => {
+        const entries = Object.entries(types).sort((a, b) => b[1] - a[1]);
+        return (
+          <div style={{ display: "flex", height: 8, borderRadius: 4, overflow: "hidden", background: C.border }}>
+            {entries.map(([type, count]) => (
+              <div
+                key={type}
+                title={`${type}: ${count}`}
+                style={{ width: `${(count / total) * 100}%`, background: typeColor(type), minWidth: 2 }}
+              />
+            ))}
+          </div>
+        );
+      };
+
+      return (
+        <div style={{ padding: 20 }}>
+          {/* Overall summary card */}
+          <div style={{
+            background: C.navy, borderRadius: 10, padding: "24px 28px", marginBottom: 20, color: C.white,
+          }}>
+            <div style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em", textTransform: "uppercase", opacity: 0.6, marginBottom: 14 }}>
+              System Overview
+            </div>
+            <div style={{ display: "flex", gap: 32, flexWrap: "wrap", marginBottom: 18 }}>
+              <div>
+                <div style={{ fontSize: 32, fontWeight: 800, lineHeight: 1 }}>{totalStats.componentCount}</div>
+                <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>Components</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 32, fontWeight: 800, lineHeight: 1 }}>{totalStats.qty}</div>
+                <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>Total Qty</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 32, fontWeight: 800, lineHeight: 1, color: "#fdba74" }}>{totalStats.drives}</div>
+                <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>Drives</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 32, fontWeight: 800, lineHeight: 1, color: "#f9a8d4" }}>{totalStats.sensors}</div>
+                <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>Sensors</div>
+              </div>
+              <div>
+                <div style={{ fontSize: 32, fontWeight: 800, lineHeight: 1 }}>{zoneData.length}</div>
+                <div style={{ fontSize: 11, opacity: 0.6, marginTop: 4 }}>Zones</div>
+              </div>
+            </div>
+            <div style={{ marginBottom: 6, fontSize: 10, fontWeight: 600, letterSpacing: "0.06em", textTransform: "uppercase", opacity: 0.5 }}>Type Distribution</div>
+            <div style={{ display: "flex", height: 10, borderRadius: 5, overflow: "hidden", background: "rgba(255,255,255,0.15)" }}>
+              {Object.entries(totalStats.types).sort((a, b) => b[1] - a[1]).map(([type, count]) => (
+                <div
+                  key={type}
+                  title={`${type}: ${count}`}
+                  style={{ width: `${(count / totalStats.componentCount) * 100}%`, background: typeColor(type), minWidth: 3 }}
+                />
+              ))}
+            </div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 10 }}>
+              {Object.entries(totalStats.types).sort((a, b) => b[1] - a[1]).map(([type, count]) => (
+                <div key={type} style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 11, opacity: 0.8 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: typeColor(type) }} />
+                  <span>{type}</span>
+                  <span style={{ fontWeight: 700 }}>{count}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Zone cards grid */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(340px, 1fr))", gap: 14 }}>
+            {zoneData.map((zd) => {
+              const zoneDrives  = zd.components.reduce((s, c) => s + (editData[c.rowKey]?.drives || 0), 0);
+              const zoneSensors = zd.components.reduce((s, c) => s + (editData[c.rowKey]?.sensors || 0), 0);
+              const zoneQty     = zd.components.reduce((s, c) => s + c.qty, 0);
+              const eqNums      = zd.components.map((c) => c.eqNum).sort((a, b) => {
+                const ap = parseEqNum(a), bp = parseEqNum(b);
+                for (let i = 0; i < Math.max(ap.length, bp.length); i++) {
+                  const diff = (ap[i] || 0) - (bp[i] || 0);
+                  if (diff !== 0) return diff;
+                }
+                return 0;
+              });
+              return (
+                <div key={zd.zone} style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden", background: C.white }}>
+                  <div style={{ background: C.navy, color: C.white, padding: "10px 16px", fontWeight: 700, fontSize: 13, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+                    Zone {zd.zone}
+                  </div>
+                  <div style={{ padding: "14px 16px" }}>
+                    <div style={{ display: "flex", gap: 16, marginBottom: 12 }}>
+                      <div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: C.navy, lineHeight: 1 }}>{zd.components.length}</div>
+                        <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>Components</div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: C.navy, lineHeight: 1 }}>{zoneQty}</div>
+                        <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>Qty</div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: "#ea580c", lineHeight: 1 }}>{zoneDrives}</div>
+                        <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>Drives</div>
+                      </div>
+                      <div>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: "#db2777", lineHeight: 1 }}>{zoneSensors}</div>
+                        <div style={{ fontSize: 10, color: C.textMuted, marginTop: 2 }}>Sensors</div>
+                      </div>
+                    </div>
+                    <div style={{ marginBottom: 10 }}>
+                      <TypeBar types={zd.types} total={zd.components.length} />
+                    </div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+                      {Object.entries(zd.types).sort((a, b) => b[1] - a[1]).map(([type, count]) => (
+                        <span key={type} style={{ fontSize: 10, color: C.textMuted, display: "flex", alignItems: "center", gap: 4 }}>
+                          <span style={{ width: 6, height: 6, borderRadius: "50%", background: typeColor(type) }} />
+                          {type} ({count})
+                        </span>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 11, color: C.textLight, fontFamily: "monospace" }}>
+                      {eqNums[0]} {"\u2014"} {eqNums[eqNums.length - 1]}
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // MAIN APP
+    // ─────────────────────────────────────────────────────────────────────────
+    function App() {
+      const [rows, setRows]         = useState(null);
+      const [tab, setTab]           = useState("components");
+      const [dragging, setDragging] = useState(false);
+      const [fileName, setFileName] = useState("");
+      const [editData, setEditData] = useState({});
+
+      // localStorage persistence — wrapped in try/catch so storage errors never crash the page
+      useEffect(() => {
+        if (!fileName || Object.keys(editData).length === 0) return;
+        try {
+          localStorage.setItem("component_portal_" + fileName, JSON.stringify(editData));
+        } catch (e) {
+          console.warn("Could not save to localStorage:", e);
+        }
+      }, [editData, fileName]);
+
+      const handleFile = (file) => {
+        if (!file) return;
+        setFileName(file.name);
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const parsed = parseATTEXT(e.target.result);
+          setRows(parsed);
+          // Restore saved edit data
+          try {
+            const saved = localStorage.getItem("component_portal_" + file.name);
+            if (saved) {
+              try { setEditData(JSON.parse(saved)); }
+              catch { setEditData({}); }
+            } else {
+              setEditData({});
+            }
+          } catch (e) {
+            setEditData({});
+          }
+        };
+        reader.readAsText(file);
+      };
+
+      const clearSavedData = () => {
+        if (confirm("Clear all saved drives and sensor data for this file?")) {
+          setEditData({});
+          try { if (fileName) localStorage.removeItem("component_portal_" + fileName); } catch (e) {}
+        }
+      };
+
+      const onDrop = useCallback((e) => {
+        e.preventDefault();
+        setDragging(false);
+        handleFile(e.dataTransfer.files[0]);
+      }, []);
+      const onDragOver  = (e) => { e.preventDefault(); setDragging(true); };
+      const onDragLeave = () => setDragging(false);
+
+      return (
+        <div style={{ minHeight: "100vh", background: C.offWhite, fontFamily: "'Barlow', 'Inter', 'Segoe UI', sans-serif", color: C.text }}>
+          <style>{`
+            @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700;800&display=swap');
+            *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+            body { background: #f5f6f8; }
+            input[type="number"]::-webkit-inner-spin-button,
+            input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+            input[type="number"] { -moz-appearance: textfield; }
+          `}</style>
+
+          {/* HEADER */}
+          <header style={{ background: C.white, borderBottom: `3px solid ${C.navy}`, padding: "0 40px", position: "sticky", top: 0, zIndex: 100, boxShadow: "0 1px 6px rgba(0,0,0,0.07)" }}>
+            <div style={{ maxWidth: 1100, margin: "0 auto", display: "flex", alignItems: "center", height: 72 }}>
+              <MTLogo size={1} />
+              <div style={{ marginLeft: "auto", fontSize: 11, fontWeight: 700, color: C.textMuted, letterSpacing: "0.1em", textTransform: "uppercase", borderLeft: `2px solid ${C.border}`, paddingLeft: 18 }}>
+                Component Portal
+              </div>
+            </div>
+          </header>
+
+          {/* BANNER */}
+          <div style={{ background: C.navy, color: C.white, padding: "30px 40px" }}>
+            <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+              <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "0.07em", textTransform: "uppercase", marginBottom: 6 }}>
+                Component Portal
+              </h1>
+              <p style={{ fontSize: 13, opacity: 0.7, letterSpacing: "0.02em" }}>
+                Upload an ATTEXT export to view components by EQ number with drive and sensor counts
+              </p>
+            </div>
+          </div>
+
+          {/* MAIN */}
+          <main style={{ maxWidth: 1100, margin: "0 auto", padding: "36px 40px 60px" }}>
+            {/* Upload zone */}
+            <div
+              onDrop={onDrop} onDragOver={onDragOver} onDragLeave={onDragLeave}
+              onClick={() => document.getElementById("mt_file_input").click()}
+              style={{
+                border: `2px dashed ${dragging ? C.purple : C.border}`, borderRadius: 10, padding: "44px 32px",
+                textAlign: "center", marginBottom: 36, background: dragging ? "#f5f3ff" : C.white,
+                cursor: "pointer", transition: "all 0.15s ease", boxShadow: "0 1px 4px rgba(0,0,0,0.05)",
+              }}
+            >
+              <input id="mt_file_input" type="file" accept=".txt,.csv" style={{ display: "none" }} onChange={(e) => handleFile(e.target.files[0])} />
+              <svg width="44" height="44" viewBox="0 0 24 24" fill="none"
+                stroke={dragging ? C.purple : C.textLight} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"
+                style={{ display: "block", margin: "0 auto 12px" }}>
+                <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1" />
+                <polyline points="16 6 12 2 8 6" />
+                <line x1="12" y1="2" x2="12" y2="15" />
+              </svg>
+              {fileName ? (
+                <p style={{ color: C.green, fontWeight: 700, fontSize: 14, marginBottom: 4 }}>{"\u2713"} &nbsp;{fileName}</p>
+              ) : (
+                <p style={{ color: C.textMuted, fontSize: 14, marginBottom: 4 }}>
+                  Drag &amp; drop your ATTEXT export here, or&nbsp;
+                  <span style={{ color: C.navy, fontWeight: 700 }}>click to browse</span>
+                </p>
+              )}
+              {rows ? (
+                <p style={{ fontSize: 12, color: C.textLight, marginTop: 6 }}>{rows.length} rows parsed</p>
+              ) : (
+                <p style={{ fontSize: 11, color: C.textLight, marginTop: 6 }}>Accepted formats: .txt &nbsp;·&nbsp; .csv</p>
+              )}
+            </div>
+
+            {/* Results */}
+            {rows && (
+              <>
+                <div style={{ display: "flex", alignItems: "center", borderBottom: `2px solid ${C.border}`, marginBottom: 24 }}>
+                  {[["components", "Component List"], ["zones", "Zone Summary"], ["topology", "System Topology"]].map(([key, label]) => (
+                    <button key={key} onClick={() => setTab(key)}
+                      style={{
+                        padding: "10px 28px", fontSize: 12, fontWeight: 700, letterSpacing: "0.07em",
+                        textTransform: "uppercase", border: "none", background: "none", cursor: "pointer",
+                        color: tab === key ? C.navy : C.textMuted,
+                        borderBottom: `3px solid ${tab === key ? C.navy : "transparent"}`,
+                        marginBottom: -2, transition: "all 0.15s ease", fontFamily: "inherit",
+                      }}>
+                      {label}
+                    </button>
+                  ))}
+
+                  {Object.keys(editData).length > 0 && (
+                    <button
+                      onClick={(e) => { e.stopPropagation(); clearSavedData(); }}
+                      style={{
+                        marginLeft: "auto", padding: "5px 12px", borderRadius: 6, fontSize: 11,
+                        fontFamily: "inherit", border: `1px solid ${C.border}`, background: C.white,
+                        color: C.textMuted, cursor: "pointer", marginBottom: 4,
+                      }}
+                    >
+                      Clear saved data
+                    </button>
+                  )}
+                </div>
+
+                <div style={{ background: C.white, borderRadius: 8, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,0.07)", border: `1px solid ${C.border}` }}>
+                  {tab === "components" && <ErrorBoundary><ComponentListView rows={rows} editData={editData} setEditData={setEditData} /></ErrorBoundary>}
+                  {tab === "zones" && <ZoneSummaryView rows={rows} editData={editData} />}
+                  {tab === "topology" && <div style={{ padding: 20 }}><TopologyView rows={rows} /></div>}
+                </div>
+              </>
+            )}
+          </main>
+
+          {/* FOOTER */}
+          <footer style={{ background: C.navyDark, color: C.white, padding: "22px 40px" }}>
+            <div style={{ maxWidth: 1100, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                <span style={{ fontSize: 16, fontWeight: 700, color: C.white }}>MotionTech</span>
+                <svg width="20" height="20" viewBox="0 0 36 36" fill="none">
+                  <defs>
+                    <linearGradient id="mt_ring_footer" x1="4" y1="4" x2="32" y2="32" gradientUnits="userSpaceOnUse">
+                      <stop offset="0%" stopColor="#a78bfa" />
+                      <stop offset="100%" stopColor="#60a5fa" />
+                    </linearGradient>
+                  </defs>
+                  <circle cx="18" cy="18" r="13" stroke="url(#mt_ring_footer)" strokeWidth="4" fill="none" strokeLinecap="round" />
+                </svg>
+              </div>
+              <span style={{ fontSize: 10, opacity: 0.45, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+                Component Portal &nbsp;·&nbsp; Internal Tool
+              </span>
+            </div>
+          </footer>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
