@@ -68,6 +68,7 @@
     const resolveType = (row) => row.type || getType(row.blName);
 
     const parseEqNum = (eq) => eq.split(".").map(Number);
+    const subsysKey  = (eqNum) => eqNum.split(".").slice(0, 2).join(".");
 
     const buildComponentList = (rows) => {
       const map = {};
@@ -130,7 +131,7 @@
         return [
           `"${c.eqNum}"`,
           `"${c.type}"`,
-          `"${c.description.replace(/"/g, '""')}"`,
+          `"${(editData[c.rowKey]?.description || c.description).replace(/"/g, '""')}"`,
           c.qty,
           d.drives || 0,
           d.sensors || 0,
@@ -275,13 +276,16 @@
       </div>
     );
 
-    const TopologyNode = ({ node, depth }) => {
+    const TopologyNode = ({ node, depth, editData }) => {
       const [open, setOpen] = useState(true);
       const keys  = Object.keys(node.children).sort((a, b) => Number(a) - Number(b));
       const items = node.items || [];
       return (
         <div style={{ marginLeft: depth * 18 }}>
-          {items.map((item, i) => <EqRow key={i} eqNum={item.eqNum} name={item.name} />)}
+          {items.map((item, i) => (
+            <EqRow key={i} eqNum={item.eqNum}
+              name={editData?.[item.eqNum + "||" + item.blName]?.description || item.name} />
+          ))}
           {keys.length > 0 && (
             <>
               <button onClick={() => setOpen((o) => !o)}
@@ -289,14 +293,14 @@
                 <span>{open ? "\u25be" : "\u25b8"}</span>
                 <span>{keys.length} sub-item{keys.length !== 1 ? "s" : ""}</span>
               </button>
-              {open && keys.map((k) => <TopologyNode key={k} node={node.children[k]} depth={depth + 1} />)}
+              {open && keys.map((k) => <TopologyNode key={k} node={node.children[k]} depth={depth + 1} editData={editData} />)}
             </>
           )}
         </div>
       );
     };
 
-    const TopologyView = ({ rows }) => {
+    const TopologyView = ({ rows, editData = {} }) => {
       const { tree, items } = buildTopology(rows);
       const lines = Object.keys(tree.children).sort((a, b) => Number(a) - Number(b));
       const [openLines, setOpenLines] = useState({});
@@ -324,9 +328,12 @@
                 </button>
                 {isOpen && (
                   <div style={{ padding: "14px 18px", background: C.white }}>
-                    {(lineNode.items || []).map((item, i) => <EqRow key={i} eqNum={item.eqNum} name={item.name} />)}
+                    {(lineNode.items || []).map((item, i) => (
+                      <EqRow key={i} eqNum={item.eqNum}
+                        name={editData[item.eqNum + "||" + item.blName]?.description || item.name} />
+                    ))}
                     {Object.keys(lineNode.children).sort((a, b) => Number(a) - Number(b)).map((k) => (
-                      <TopologyNode key={k} node={lineNode.children[k]} depth={1} />
+                      <TopologyNode key={k} node={lineNode.children[k]} depth={1} editData={editData} />
                     ))}
                   </div>
                 )}
@@ -375,6 +382,160 @@
             transition: "border-color 0.15s",
           }}
         />
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EDITABLE DESCRIPTION CELL — text input, commits on blur/Enter
+    // ─────────────────────────────────────────────────────────────────────────
+    const EditableDescriptionCell = ({ baseValue, storedValue, onCommit }) => {
+      const ref = useRef(null);
+      const displayed = storedValue || baseValue;
+
+      useEffect(() => {
+        if (ref.current && ref.current !== document.activeElement) {
+          ref.current.value = displayed;
+        }
+      }, [displayed]);
+
+      return (
+        <input
+          ref={ref}
+          type="text"
+          defaultValue={displayed}
+          title={storedValue ? `Original: ${baseValue}` : "Click to edit description"}
+          onFocus={(e) => { e.target.select(); e.target.style.borderBottomColor = C.blue; e.target.style.cursor = "text"; }}
+          onBlur={(e) => {
+            e.target.style.borderBottomColor = "transparent";
+            e.target.style.cursor = "default";
+            const val = e.target.value.trim();
+            e.target.value = val || baseValue;
+            onCommit(val || null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") e.target.blur();
+            if (e.key === "Escape") { e.target.value = displayed; e.target.blur(); }
+          }}
+          style={{
+            width: "100%", border: "none",
+            borderBottom: "1px solid transparent",
+            background: "transparent", fontSize: 12, fontFamily: "monospace",
+            color: storedValue ? C.navy : C.text,
+            fontWeight: storedValue ? 600 : 400,
+            outline: "none", padding: "2px 0",
+            transition: "border-color 0.15s",
+            cursor: "default",
+          }}
+        />
+      );
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ZONE + SUBSYSTEM SECTION (two-level collapsible hierarchy)
+    // ─────────────────────────────────────────────────────────────────────────
+    const ZoneSubsystemSection = ({ groupKey, items, editData, updateEdit }) => {
+      const [zoneOpen, setZoneOpen]   = useState(true);
+      const [subsysOpen, setSubsysOpen] = useState({});
+
+      const subsystems = useMemo(() => {
+        const map = {};
+        items.forEach((r) => {
+          const sk = subsysKey(r.eqNum);
+          if (!map[sk]) map[sk] = [];
+          map[sk].push(r);
+        });
+        return Object.entries(map).sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
+      }, [items]);
+
+      const zoneQty     = items.reduce((s, r) => s + r.qty, 0);
+      const zoneDrives  = items.reduce((s, r) => s + (editData[r.rowKey]?.drives || 0), 0);
+      const zoneSensors = items.reduce((s, r) => s + (editData[r.rowKey]?.sensors || 0), 0);
+
+      const toggleSubsys = (sk) =>
+        setSubsysOpen((prev) => ({ ...prev, [sk]: prev[sk] === false ? true : false }));
+
+      return (
+        <tbody>
+          {/* Zone header */}
+          <tr onClick={() => setZoneOpen((v) => !v)} style={{ background: C.navy, cursor: "pointer" }}>
+            <td colSpan={6} style={{ padding: "7px 14px", color: C.white, fontWeight: 700, fontSize: 12, letterSpacing: "0.06em" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <span>{zoneOpen ? "\u25be" : "\u25b8"} {groupKey}</span>
+                <span style={{ fontWeight: 400, opacity: 0.6, fontSize: 11 }}>
+                  ({subsystems.length} subsystem{subsystems.length !== 1 ? "s" : ""}, {items.length} item{items.length !== 1 ? "s" : ""})
+                </span>
+                <span style={{ marginLeft: "auto", fontSize: 11, opacity: 0.75, display: "flex", gap: 14 }}>
+                  <span>Qty: <strong>{zoneQty}</strong></span>
+                  <span>Drives: <strong style={{ color: "#fdba74" }}>{zoneDrives}</strong></span>
+                  <span>Sensors: <strong style={{ color: "#f9a8d4" }}>{zoneSensors}</strong></span>
+                </span>
+              </div>
+            </td>
+          </tr>
+
+          {zoneOpen && subsystems.map(([sk, ssItems]) => {
+            const isOpen      = subsysOpen[sk] !== false;
+            const ssQty       = ssItems.reduce((s, r) => s + r.qty, 0);
+            const ssDrives    = ssItems.reduce((s, r) => s + (editData[r.rowKey]?.drives || 0), 0);
+            const ssSensors   = ssItems.reduce((s, r) => s + (editData[r.rowKey]?.sensors || 0), 0);
+
+            return (
+              <React.Fragment key={sk}>
+                {/* Subsystem header */}
+                <tr onClick={() => toggleSubsys(sk)} style={{ background: "#e0e7ff", cursor: "pointer" }}>
+                  <td colSpan={6} style={{ padding: "5px 14px 5px 32px", fontWeight: 600, fontSize: 11, color: C.navy, letterSpacing: "0.04em" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <span style={{ fontFamily: "monospace" }}>{isOpen ? "\u25be" : "\u25b8"} {sk}</span>
+                      <span style={{ fontWeight: 400, color: C.textMuted, fontSize: 11 }}>
+                        ({ssItems.length} item{ssItems.length !== 1 ? "s" : ""})
+                      </span>
+                      <span style={{ marginLeft: "auto", fontSize: 11, color: C.textMuted, display: "flex", gap: 14 }}>
+                        <span>Qty: <strong style={{ color: C.navy }}>{ssQty}</strong></span>
+                        <span>Drives: <strong style={{ color: "#ea580c" }}>{ssDrives}</strong></span>
+                        <span>Sensors: <strong style={{ color: "#db2777" }}>{ssSensors}</strong></span>
+                      </span>
+                    </div>
+                  </td>
+                </tr>
+
+                {/* Data rows */}
+                {isOpen && ssItems.map((comp, i) => {
+                  const color = typeColor(comp.type);
+                  const d = editData[comp.rowKey] || {};
+                  return (
+                    <tr key={comp.rowKey} style={{ background: i % 2 === 0 ? C.white : C.rowAlt }}>
+                      <td style={{ padding: "6px 14px 6px 40px", borderBottom: `1px solid ${C.border}`, fontSize: 12, fontFamily: "monospace", color: C.navy, fontWeight: 700 }}>
+                        {comp.eqNum}
+                      </td>
+                      <td style={{ padding: "6px 14px", borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                          <span style={{ width: 9, height: 9, borderRadius: "50%", background: color, flexShrink: 0 }} />
+                          <span style={{ color: C.text }}>{comp.type}</span>
+                        </div>
+                      </td>
+                      <td style={{ padding: "4px 14px", borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
+                        <EditableDescriptionCell
+                          baseValue={comp.description}
+                          storedValue={editData[comp.rowKey]?.description || null}
+                          onCommit={(val) => updateEdit(comp.rowKey, "description", val)}
+                        />
+                      </td>
+                      <td style={{ padding: "6px 14px", textAlign: "right", borderBottom: `1px solid ${C.border}`, fontSize: 12, color: C.navy, fontWeight: 700 }}>
+                        {comp.qty}
+                      </td>
+                      <td style={{ padding: "4px 8px", textAlign: "right", borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
+                        <NumericCell storedValue={d.drives || 0} onCommit={(num) => updateEdit(comp.rowKey, "drives", num)} activeColor="#ea580c" />
+                      </td>
+                      <td style={{ padding: "4px 8px", textAlign: "right", borderBottom: `1px solid ${C.border}`, fontSize: 12 }}>
+                        <NumericCell storedValue={d.sensors || 0} onCommit={(num) => updateEdit(comp.rowKey, "sensors", num)} activeColor="#db2777" />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </React.Fragment>
+            );
+          })}
+        </tbody>
       );
     };
 
@@ -429,8 +590,12 @@
                     <span style={{ color: C.text }}>{comp.type}</span>
                   </div>
                 </td>
-                <td style={{ ...tdStyle(), fontFamily: "monospace", color: C.text }}>
-                  {comp.description}
+                <td style={{ ...tdStyle(), padding: "4px 14px" }}>
+                  <EditableDescriptionCell
+                    baseValue={comp.description}
+                    storedValue={editData[comp.rowKey]?.description || null}
+                    onCommit={(val) => updateEdit(comp.rowKey, "description", val)}
+                  />
                 </td>
                 <td style={{ ...tdStyle("right"), color: C.navy, fontWeight: 700 }}>
                   {comp.qty}
@@ -479,14 +644,13 @@
         if (zoneFilter !== "all") data = data.filter((r) => r.zone === zoneFilter);
         if (textFilter) {
           const q = textFilter.toLowerCase();
-          data = data.filter((r) =>
-            r.eqNum.toLowerCase().includes(q) ||
-            r.description.toLowerCase().includes(q) ||
-            r.type.toLowerCase().includes(q)
-          );
+          data = data.filter((r) => {
+            const desc = (editData[r.rowKey]?.description || r.description).toLowerCase();
+            return r.eqNum.toLowerCase().includes(q) || desc.includes(q) || r.type.toLowerCase().includes(q);
+          });
         }
         return data;
-      }, [allComponents, typeFilters, zoneFilter, textFilter]);
+      }, [allComponents, typeFilters, zoneFilter, textFilter, editData]);
 
       const sorted = useMemo(() => {
         const dir = sortDir === "asc" ? 1 : -1;
@@ -515,6 +679,17 @@
 
       const grouped = useMemo(() => {
         if (groupBy === "none") return [{ key: null, items: sorted }];
+        if (groupBy === "subsystem") {
+          const map = {};
+          sorted.forEach((r) => {
+            const key = `Zone ${r.zone}`;
+            if (!map[key]) map[key] = [];
+            map[key].push(r);
+          });
+          return Object.entries(map)
+            .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+            .map(([key, items]) => ({ key, items, mode: "subsystem" }));
+        }
         const map = {};
         sorted.forEach((r) => {
           const key = groupBy === "type" ? r.type : `Zone ${r.zone}`;
@@ -662,6 +837,7 @@
               <option value="none">No grouping</option>
               <option value="type">Group by type</option>
               <option value="zone">Group by zone</option>
+              <option value="subsystem">Zone + Subsystem</option>
             </select>
 
             <button
@@ -733,15 +909,11 @@
                 </tr>
               </thead>
 
-              {grouped.map(({ key: groupKey, items }) => (
-                <ComponentGroupSection
-                  key={groupKey ?? "__all__"}
-                  groupKey={groupKey}
-                  items={items}
-                  editData={editData}
-                  updateEdit={updateEdit}
-                />
-              ))}
+              {grouped.map(({ key: groupKey, items, mode }) =>
+                mode === "subsystem"
+                  ? <ZoneSubsystemSection key={groupKey} groupKey={groupKey} items={items} editData={editData} updateEdit={updateEdit} />
+                  : <ComponentGroupSection key={groupKey ?? "__all__"} groupKey={groupKey} items={items} editData={editData} updateEdit={updateEdit} />
+              )}
 
               <tfoot>
                 <tr style={{ background: "#dbeafe" }}>
@@ -1082,7 +1254,7 @@
                 <div style={{ background: C.white, borderRadius: 8, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,0.07)", border: `1px solid ${C.border}` }}>
                   {tab === "components" && <ErrorBoundary><ComponentListView rows={rows} editData={editData} setEditData={setEditData} /></ErrorBoundary>}
                   {tab === "zones" && <ZoneSummaryView rows={rows} editData={editData} />}
-                  {tab === "topology" && <div style={{ padding: 20 }}><TopologyView rows={rows} /></div>}
+                  {tab === "topology" && <div style={{ padding: 20 }}><TopologyView rows={rows} editData={editData} /></div>}
                 </div>
               </>
             )}
